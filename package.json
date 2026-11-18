@@ -1,0 +1,37 @@
+{
+  "name": "opencode-claude-plugin",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "bun build src/index.ts --outfile dist/index.js --target node --external @ai-sdk/provider && bun build src/plugin.ts --outfile dist/plugin/server.js --target node",
+    "test": "bun test ./test/map.test.ts ./test/model.test.ts ./test/history.test.ts",
+    "test:live": "bun test test/live.test.ts"
+  },
+  "dependencies": {
+    "@ai-sdk/provider": "^3.0.8"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "bun-types": "^1.4.3"
+  },
+  "description": "OpenCode provider for the Claude Code CLI: built-in Claude tools rendered as native OpenCode tools, no MCP token bloat",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/santhoshkammari/opencode-claude-plugin.git"
+  },
+  "homepage": "https://github.com/santhoshkammari/opencode-claude-plugin",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "claude",
+    "claude-code",
+    "anthropic",
+    "ai-sdk",
+    "provider",
+    "coding-agent",
+    "mcp",
+    "llm"
+  ]
+}
