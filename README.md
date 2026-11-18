@@ -19,6 +19,22 @@ This plugin keeps Claude on its built-in tools and maps their names and inputs t
 
 Need more tools? Set the `tools` option (e.g. `"Bash,Read,Edit,Grep"`) to enable more built-ins. Each one costs tokens only if you turn it on.
 
+## What we cut
+
+Cutting is the whole point. Every item below is switched off, so none of it lands in your context:
+
+| Disabled | How |
+|---|---|
+| All built-in tools except `Bash` and `Read` | `--tools Bash,Read` |
+| MCP servers and their tool schemas | `--strict-mcp-config` |
+| Skills and slash commands | `--disable-slash-commands` |
+| Settings, hooks, plugins | `--setting-sources ""` |
+| `CLAUDE.md` files | `CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` |
+| Auto memory | `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` |
+| Git instructions in the prompt | `CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS=1` |
+| Background tasks | `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` |
+| Claude Code's long system prompt | replaced by a short one (`systemPrompt` option) |
+
 ## How it works
 
 ```
