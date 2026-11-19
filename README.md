@@ -49,6 +49,7 @@ OpenCode ──► claude CLI (stream-json) ──► Claude runs its own tools
 - One OpenCode session = one Claude session (`--resume`, fork, Plan mode → read-only).
 - Switch a session between Claude and any other provider without losing history.
 - `/compact` runs Claude's own compaction on the real session (headless `claude --resume <id> "/compact"`), so Claude's context actually shrinks. OpenCode-triggered compaction (auto-compact included) does the same after writing its summary; set `compactClaude: false` to turn that off.
+- Token counts match Claude's own `/context`: OpenCode shows the real context size of Claude's last API call (verified equal after normal turns, tool turns, undo and compact). Type `/context` in OpenCode for Claude's breakdown (system prompt, tools, messages).
 - `/undo` rewinds Claude too: the plugin records Claude's last message per turn, and when OpenCode's history has fewer turns it resumes the transcript at that point (`--resume-session-at`); undo everything and a fresh Claude session starts from the history. File changes are not reverted by this; OpenCode's own snapshot revert handles files.
 - Stop (Esc) interrupts Claude cleanly; failed auth/usage limits don't retry-loop.
 

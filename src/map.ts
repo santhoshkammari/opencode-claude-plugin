@@ -93,7 +93,7 @@ export class Mapper {
     if (f.type === "stream_event") {
       // Last API call's usage = the real context size now. The result frame sums every call in the turn
       // (N tool calls -> ~N x the context), which made opencode think the window was full and compact early.
-      if (f.event?.type === "message_delta" && f.event.usage) this.lastCall = toUsage(f.event.usage)
+      if (f.event?.type === "message_delta" && f.event.usage && !f.parent_tool_use_id) this.lastCall = toUsage(f.event.usage)
       return this.stream(f.event)
     }
     if (f.type === "user") return this.toolResults(f.message?.content)

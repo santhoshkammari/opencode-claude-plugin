@@ -208,6 +208,47 @@ export function compactClaude(s: Settings, modelId: string, session: string, cwd
   })
 }
 
+export interface ContextUsage { total: number; max: number; categories: { name: string; tokens: number; kind: string }[] }
+
+/** Claude's own `/context` numbers for a session (control request get_context_usage): what Claude counts as the context now. */
+export function contextUsage(s: Settings, modelId: string, session: string, cwd: string, system?: string): Promise<ContextUsage> {
+  const args = [
+    "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--model", modelId, "--resume", session,
+    "--tools", s.tools ?? "Bash,Read", "--setting-sources", "", "--strict-mcp-config",
+    "--system-prompt", system ?? s.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
+  ]
+  return new Promise((resolve, reject) => {
+    const child = spawn(s.cliPath ?? "claude", args, { cwd, env: childEnv(), stdio: ["pipe", "pipe", "pipe"] })
+    child.stdin.on("error", () => {})
+    child.stdin.write(JSON.stringify({ type: "control_request", request_id: "ocn_ctx", request: { subtype: "get_context_usage" } }) + "\n")
+    let stderr = "", done = false
+    child.stderr.on("data", (d) => (stderr += d))
+    const finish = (err?: Error, v?: ContextUsage) => { if (done) return; done = true; child.stdin.end(); setTimeout(() => child.kill("SIGTERM"), 500).unref?.(); err ? reject(err) : resolve(v!) }
+    createInterface({ input: child.stdout }).on("line", (line) => {
+      let f: any
+      try { f = JSON.parse(line) } catch { return }
+      if (f.type !== "control_response" || f.response?.request_id !== "ocn_ctx") return
+      const r = f.response.response
+      if (f.response.subtype !== "success" || typeof r?.totalTokens !== "number") return finish(new Error("claude returned no context usage"))
+      finish(undefined, { total: r.totalTokens, max: r.maxTokens, categories: (r.categories ?? []).map((c: any) => ({ name: c.name, tokens: c.tokens, kind: c.kind })) })
+    })
+    child.on("error", (e) => finish(new Error(`cannot run ${s.cliPath ?? "claude"}: ${e.message}`)))
+    child.on("close", () => finish(new Error(stderr.trim() || "claude exited before reporting context usage")))
+  })
+}
+
+const k = (n: number) => (n >= 1_000_000 ? `${+(n / 1_000_000).toFixed(1)}m` : n >= 1000 ? `${+(n / 1000).toFixed(1)}k` : String(n))
+export function formatContext(u: ContextUsage): string {
+  const rows = u.categories.map((c) => `| ${c.name} | ${c.tokens.toLocaleString("en")} | ${((c.tokens / u.max) * 100).toFixed(1)}% |`)
+  return `## Context Usage\n\n**Tokens:** ${k(u.total)} / ${k(u.max)} (${((u.total / u.max) * 100).toFixed(1)}%)\n\n| Category | Tokens | Percentage |\n|---|---|---|\n${rows.join("\n")}\n`
+}
+
+/** `/context` typed in opencode. */
+export const isContextCommand = (prompt: LanguageModelV3CallOptions["prompt"]) => {
+  const last = (prompt as any[]).filter((m) => m.role === "user").at(-1)
+  return !!last && /^\s*\/context\s*$/.test(textOf(last.content))
+}
+
 /**
  * Agent-context requests that must not become a turn in the Claude session: compaction, and session generate
  * (core/src/session/generate.ts, "generate from session context without mutating the session"). Primary turns
@@ -322,6 +363,10 @@ export class ClaudeNativeModel implements LanguageModelV3 {
   readonly supportedUrls = {}
   constructor(readonly modelId: string, readonly provider: string, private s: Settings) {}
 
+  private systemFor(o: LanguageModelV3CallOptions) {
+    return [this.s.systemPrompt ?? DEFAULT_SYSTEM_PROMPT, opencodeInstructions(o.prompt)].filter(Boolean).join("\n\n")
+  }
+
   async doGenerate(): Promise<never> {
     throw new Error("opencode-claude-native supports streaming only")
   }
@@ -351,6 +396,16 @@ export class ClaudeNativeModel implements LanguageModelV3 {
     // context but neither runs tools nor leaves the summary prompt in the transcript.
     if (isSideJob(o)) return this.helper(o, own, ocSession)
 
+    // `/context` typed in opencode: Claude's own breakdown, and its total becomes the usage opencode shows.
+    if (isContextCommand(o.prompt)) {
+      if (!own) return { stream: textStream("No Claude session for this conversation yet.") }
+      try {
+        const ctx = await contextUsage(this.s, this.modelId, own, workingDir(o.prompt, this.s.cwd), this.systemFor(o))
+        return { stream: textStream(formatContext(ctx), ctx.total) }
+      } catch (e: any) {
+        return { stream: textStream(`Could not read Claude's context: ${e.message}`) }
+      }
+    }
     // `/compact` typed in opencode: compact the real Claude session instead of sending the word to Claude as a prompt.
     const compactArg = compactCommand(o.prompt)
     if (compactArg !== undefined) {
@@ -360,7 +415,10 @@ export class ClaudeNativeModel implements LanguageModelV3 {
       try {
         const { pre, post } = await done
         if (ocSession !== "default") setTurnEnds(ocSession, {})
-        return { stream: textStream(`Compacted Claude context: ${pre.toLocaleString("en")} → ${post.toLocaleString("en")} tokens.`, post) }
+        // post_tokens is messages only; Claude's /context total adds the system prompt and tool definitions
+        const ctx = await contextUsage(this.s, this.modelId, own, workingDir(o.prompt, this.s.cwd), this.systemFor(o)).catch(() => undefined)
+        const total = ctx?.total ?? post
+        return { stream: textStream(`Compacted Claude context: messages ${pre.toLocaleString("en")} → ${post.toLocaleString("en")} tokens. Total context now ${total.toLocaleString("en")} tokens.`, total) }
       } catch (e: any) {
         return { stream: new ReadableStream({ start: (c) => { c.enqueue({ type: "stream-start", warnings: [] }); c.enqueue({ type: "error", error: claudeError(e.message) }); c.enqueue({ type: "finish", finishReason: { unified: "error", raw: "error" }, usage: { inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 0, text: 0, reasoning: 0 } } }); c.close() } }) }
       }
@@ -397,7 +455,7 @@ export class ClaudeNativeModel implements LanguageModelV3 {
       "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose",
       "--model", this.modelId,
       ...leanArgs(this.s.tools),
-      "--system-prompt", [this.s.systemPrompt ?? DEFAULT_SYSTEM_PROMPT, opencodeInstructions(o.prompt)].filter(Boolean).join("\n\n"),
+      "--system-prompt", this.systemFor(o),
       ...(inPlanMode(o.prompt) ? ["--permission-mode", "plan"] : ["--dangerously-skip-permissions"]),
       ...(existing ? ["--resume", existing] : []),
       ...(resumeAt ? ["--resume-session-at", resumeAt] : []),

@@ -5,7 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createClaudeNative } from "../src/index"
 import { rewindPoint } from "../src/history"
-import { claudeError, compactCommand, opencodeInstructions } from "../src/model"
+import { claudeError, compactCommand, formatContext, isContextCommand, opencodeInstructions } from "../src/model"
 
 const fake = new URL("./fake-claude.mjs", import.meta.url).pathname
 chmodSync(fake, 0o755)
@@ -341,4 +341,13 @@ test("after /undo the next turn resumes at the recorded message; undoing everyth
   expect(argv[2]).not.toContain("--resume-session-at")
   expect(argv[3]).toContain("--resume-session-at")
   expect(argv[4]).not.toContain("--resume")
+})
+
+test("/context is detected and formatted like Claude's own breakdown", () => {
+  const p = (t: string) => [{ role: "user", content: [{ type: "text", text: t }] }] as any
+  expect(isContextCommand(p("/context "))).toBe(true)
+  expect(isContextCommand(p("/context please"))).toBe(false)
+  const out = formatContext({ total: 4715, max: 1_000_000, categories: [{ name: "Messages", tokens: 1650, kind: "used" }] })
+  expect(out).toContain("**Tokens:** 4.7k / 1m (0.5%)")
+  expect(out).toContain("| Messages | 1,650 | 0.2% |")
 })
