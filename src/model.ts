@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import { createInterface } from "node:readline"
 import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { Mapper } from "./map.js"
-import { assistantCount, conversation, freshStart, hasCheckpoint, rewindPoint, promptText, summaryKey, upToDate } from "./history.js"
+import { NATIVE, assistantCount, conversation, freshStart, hasCheckpoint, rewindPoint, promptText, summaryKey, upToDate } from "./history.js"
 import { getTurnEnds, setTurnEnds, getClaudeSession, clearClaudeSession, getKnownSummary, setClaudeSession, setKnownSummary } from "./sessions.js"
 
 export interface Settings { cliPath?: string; cwd?: string; extraArgs?: string[]; systemPrompt?: string; tools?: string; compactClaude?: boolean }
@@ -180,12 +180,24 @@ export function compactCommand(prompt: LanguageModelV3CallOptions["prompt"]): st
   return m ? m[1].trim() : undefined
 }
 
+/** The summary text inside the message Claude's compaction writes into the session (without its resume boilerplate). */
+export function nativeSummary(content: string): string {
+  const from = content.indexOf("Summary:\n")
+  const text = from >= 0 ? content.slice(from + "Summary:\n".length) : content
+  const to = text.indexOf("\nIf you need specific details from before compaction")
+  return (to >= 0 ? text.slice(0, to) : text).trim()
+}
+
+/** opencode only accepts a compaction reply that uses its template headings, so Claude's summary goes under them. */
+export const wrapSummary = (summary: string) =>
+  `## Objective\n- Claude's own compaction summary of this session (below).\n\n## Important Context\n${summary}\n`
+
 /**
  * Claude's own `/compact` on a real Claude session, headless. `claude -p --resume <id> "/compact"` runs the same
  * manual compaction as the TUI (writes a compact_boundary and the summary into the transcript), so Claude's real
  * context shrinks, not just opencode's record of it. Slash commands must be on for this one call.
  */
-export function compactClaude(s: Settings, modelId: string, session: string, cwd: string, instructions = ""): Promise<{ pre: number; post: number }> {
+export function compactClaude(s: Settings, modelId: string, session: string, cwd: string, instructions = ""): Promise<{ pre: number; post: number; summary: string }> {
   const args = [
     "-p", "--output-format", "stream-json", "--verbose", "--model", modelId, "--resume", session,
     "--tools", s.tools ?? "Bash,Read", "--setting-sources", "", "--strict-mcp-config",
@@ -196,15 +208,17 @@ export function compactClaude(s: Settings, modelId: string, session: string, cwd
     child.stdin.end(("/compact " + instructions).trim())
     let stderr = "", out = ""
     let meta: { pre: number; post: number } | undefined
+    let summary = ""
     child.stderr.on("data", (d) => (stderr += d))
     createInterface({ input: child.stdout }).on("line", (line) => {
       let f: any
       try { f = JSON.parse(line) } catch { return }
       if (f.type === "system" && f.subtype === "compact_boundary") meta = { pre: f.compact_metadata?.pre_tokens ?? 0, post: f.compact_metadata?.post_tokens ?? 0 }
+      if (f.type === "user" && meta && !summary && typeof f.message?.content === "string" && f.message.content.includes("Summary:")) summary = nativeSummary(f.message.content)
       if (f.type === "result") out = String(f.result ?? "")
     })
     child.on("error", (e) => reject(new Error(`cannot run ${s.cliPath ?? "claude"}: ${e.message}`)))
-    child.on("close", (code) => (meta ? resolve(meta) : reject(new Error(out || stderr.trim() || `claude /compact failed (exit ${code})`))))
+    child.on("close", (code) => (meta ? resolve({ ...meta, summary }) : reject(new Error(out || stderr.trim() || `claude /compact failed (exit ${code})`))))
   })
 }
 
@@ -554,6 +568,25 @@ export class ClaudeNativeModel implements LanguageModelV3 {
    * the session's transcript untouched); without, from the system prompt plus the conversation as text.
    */
   private async helper(o: LanguageModelV3CallOptions, resume?: string, ocSession?: string): Promise<{ stream: ReadableStream<LanguageModelV3StreamPart> }> {
+    // opencode asked for a compaction summary. Use Claude's own /compact on the real session (one call), and hand its
+    // summary to opencode. Only when Claude has seen the whole conversation; otherwise summarize from a fork below.
+    if (resume && ocSession && ocSession !== "default" && isCompaction(o.prompt) && this.s.compactClaude !== false && upToDate(o.prompt, getKnownSummary(ocSession))) {
+      try {
+        const cwd = workingDir(o.prompt, this.s.cwd)
+        await afterPrevious(ocSession)
+        const done = compactClaude(this.s, this.modelId, resume, cwd)
+        running.set(ocSession, done.then(() => {}, () => {}))
+        const r = await done
+        if (!r.summary) throw new Error("claude /compact wrote no summary")
+        const text = wrapSummary(r.summary)
+        setKnownSummary(ocSession, NATIVE + summaryKey(text))
+        setTurnEnds(ocSession, {})
+        const ctx = await contextUsage(this.s, this.modelId, resume, cwd, this.systemFor(o)).catch(() => undefined)
+        return { stream: textStream(text, ctx?.total ?? r.post) }
+      } catch (e: any) {
+        trace({ event: "native-compact-failed", error: String(e) })
+      }
+    }
     const args = [
       "-p", "--output-format", "stream-json", "--include-partial-messages", "--verbose",
       "--model", this.modelId, "--tools", "", "--no-session-persistence",
@@ -591,16 +624,10 @@ export class ClaudeNativeModel implements LanguageModelV3 {
           const failed = mapper.isError || (code !== 0 && !mapper.resultText)
           if (compaction && !failed) setKnownSummary(ocSession!, synced && summary.trim() ? summaryKey(summary) : undefined)
           const finish = () => end(out, mapper, failed ? mapper.resultText || stderr || `claude exited ${code}` : undefined)
-          // opencode's summary replaces its history. Default: drop Claude's session so the next turn starts fresh from
-          // that summary (instant, no second LLM call). compactClaude: true instead runs Claude's own /compact (~45s on 100k).
-          if (compaction && !failed && resume && this.s.compactClaude === true) {
-            const done = compactClaude(this.s, this.modelId, resume, cwd)
-            running.set(ocSession!, done.then(() => {}, () => {}))
-            done.then(() => { setTurnEnds(ocSession!, {}); finish() }, (e) => { trace({ event: "compact-failed", error: String(e) }); finish() })
-          } else {
-            if (compaction && !failed && ocSession !== "default") { clearClaudeSession(ocSession!); setKnownSummary(ocSession!, undefined); setTurnEnds(ocSession!, {}) }
-            finish()
-          }
+          // Fallback (Claude had not seen everything, or its /compact failed): opencode's summary replaces the history and
+          // Claude starts fresh from it on the next turn.
+          if (compaction && !failed && ocSession !== "default") { clearClaudeSession(ocSession!); setKnownSummary(ocSession!, undefined); setTurnEnds(ocSession!, {}) }
+          finish()
         })
         // spawn failure (e.g. claude not on the PATH of opencode's service): fail the turn instead of an uncaught error
         child.on("error", (e) => end(out, mapper, `cannot run ${this.s.cliPath ?? "claude"}: ${e.message}`))

@@ -46,6 +46,8 @@ if (process.argv.includes("stream-json") && process.argv[process.argv.indexOf("-
       out({ type: "result", subtype: "error_during_execution", is_error: true, session_id: session, usage: {} })
       resultSent = true
       finish()
+    } else if (f.type === "control_request" && f.request.subtype === "get_context_usage") {
+      out({ type: "control_response", response: { subtype: "success", request_id: f.request_id, response: { totalTokens: 4321, maxTokens: 1000000, categories: [] } } })
     } else if (f.type === "control_request" && f.request.subtype === "generate_session_title") {
       out({ type: "control_response", response: { subtype: "success", request_id: f.request_id, response: { title: "Fake title" } } })
     } else if (f.type === "user" && !started) {

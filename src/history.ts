@@ -47,6 +47,9 @@ const RECENT = /<recent-context>\n?([\s\S]*?)\n?<\/recent-context>/
  */
 const recentOf = (m: Msg): string => (m.role === "user" ? RECENT.exec(textOf(m.content))?.[1]?.trim() ?? "" : "")
 
+/** Prefix of a known-summary key whose summary came from Claude's own /compact: Claude already holds the recent part too. */
+export const NATIVE = "native:"
+
 /** Short, whitespace-insensitive key for a summary, to recognise one Claude wrote. */
 export const summaryKey = (s: string) => s.replace(/\s+/g, " ").trim().slice(0, 300)
 
@@ -62,7 +65,7 @@ export function seenUpTo(msgs: Msg[], knownSummary?: string): number {
     const m = msgs[i]
     if (m.role === "assistant" && (!marked || madeByClaude(m) === true)) return i
     const s = checkpointSummary(m)
-    if (s !== undefined && knownSummary && summaryKey(s) === knownSummary) return i
+    if (s !== undefined && knownSummary && summaryKey(s) === knownSummary.replace(NATIVE, "")) return i
   }
   return -1
 }
@@ -124,7 +127,7 @@ export function promptText(prompt: Prompt, resuming: boolean, knownSummary?: str
 /** Messages before `start` that Claude has not seen, as text ('' when it is up to date). */
 function missedText(msgs: Msg[], start: number, knownSummary?: string): string {
   const seen = seenUpTo(msgs.slice(0, start), knownSummary)
-  const recent = seen >= 0 && checkpointSummary(msgs[seen]) !== undefined ? recentOf(msgs[seen]) : ""
+  const recent = seen >= 0 && !knownSummary?.startsWith(NATIVE) && checkpointSummary(msgs[seen]) !== undefined ? recentOf(msgs[seen]) : ""
   return [recent && `Recent messages kept beside the summary:\n${recent}`, renderAll(msgs.slice(seen + 1, start))]
     .filter(Boolean).join("\n\n")
 }

@@ -14,7 +14,7 @@ const fixture = new URL("./fixtures/haiku-5tools.jsonl", import.meta.url).pathna
 // opencode's primary turns carry its output limit (core/src/session/model-request.ts); generate/title do not.
 const agent = (m: any) => ({ doStream: (o: any) => m.doStream({ maxOutputTokens: 32_000, ...o }) })
 
-function setup(env: Record<string, string> = {}) {
+function setup(env: Record<string, string> = {}, settings: Record<string, unknown> = {}) {
   const dir = mkdtempSync(join(tmpdir(), "ocn-model-"))
   Object.assign(process.env, {
     OPENCODE_CLAUDE_NATIVE_STORE: join(dir, "sessions.json"),
@@ -23,7 +23,7 @@ function setup(env: Record<string, string> = {}) {
     FAKE_CLAUDE_DELAY: "0",
     ...env,
   })
-  const model: any = agent(createClaudeNative({ cliPath: fake }).languageModel("haiku"))
+  const model: any = agent(createClaudeNative({ cliPath: fake, ...settings }).languageModel("haiku"))
   const calls = () =>
     existsSync(join(dir, "log.jsonl"))
       ? readFileSync(join(dir, "log.jsonl"), "utf8").trim().split("\n").map((l) => JSON.parse(l))
@@ -203,8 +203,8 @@ test("a pasted image reaches claude as an image block", async () => {
 
 const argvOf = (calls: () => any[]) => calls().filter((c) => c.argv).map((c) => c.argv)
 
-test("compaction answers from a tool-free throwaway fork of the Claude session", async () => {
-  const { dir, model, calls } = setup()
+test("compaction fallback (compactClaude: false) answers from a tool-free throwaway fork of the Claude session", async () => {
+  const { dir, model, calls } = setup({}, { compactClaude: false })
   writeFileSync(join(dir, "sessions.json"), JSON.stringify({ ses_k: "claude-k" }))
   const summarize = user("You MUST summarize the conversation above into a structured summary.\n\nDo not continue the task or call tools.")
   const { stream } = await model.doStream({ prompt: [system(dir), user("a"), assistant("b"), summarize], headers: { "x-opencode-session-id": "ses_k" } })
@@ -218,9 +218,35 @@ test("compaction answers from a tool-free throwaway fork of the Claude session",
   expect(calls().find((c) => c.stdin).stdin).toContain("Do not continue the task")
   expect(calls().find((c) => c.argv).cwd).toBe(dir)
   expect(parts.filter((p) => p.type === "tool-call").length).toBe(5) // fixture replays tools; real claude has none
-  // opencode's summary replaces the history: no second Claude /compact, the session mapping is dropped so the next turn starts fresh
+  // opencode's summary replaces the history: no Claude /compact, the session mapping is dropped so the next turn starts fresh
   expect(calls().filter((c) => c.argv).length).toBe(1)
   expect(JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8"))).toEqual({})
+})
+
+test("opencode compaction runs Claude's own /compact once and returns its summary under opencode's headings", async () => {
+  const fx = join(tmpdir(), `ocn-native-${process.pid}.jsonl`)
+  writeFileSync(fx, [
+    { type: "system", subtype: "compact_boundary", compact_metadata: { pre_tokens: 9000, post_tokens: 900 } },
+    { type: "user", message: { role: "user", content: "This session is being continued.\n\nSummary:\n1. Primary Request: CODE=7\n\nIf you need specific details from before compaction (like exact code snippets), read the transcript at /x.jsonl" } },
+    { type: "result", subtype: "success", result: "" },
+  ].map((l) => JSON.stringify(l)).join("\n"))
+  const { dir, model, calls } = setup({ FAKE_CLAUDE_FIXTURE: fx })
+  writeFileSync(join(dir, "sessions.json"), JSON.stringify({ ses_n: "claude-n" }))
+  const summarize = user("You MUST summarize the conversation above into a structured summary.\n\nDo not continue the task or call tools.")
+  const { stream } = await model.doStream({ prompt: [system(dir), user("a"), assistant("b"), summarize], headers: { "x-opencode-session-id": "ses_n" } })
+  const parts = await collect(stream)
+  const text = parts.filter((p) => p.type === "text-delta").map((p) => p.delta).join("")
+  const usage = parts.find((p) => p.type === "finish").usage.inputTokens.total
+  const first = calls().find((c) => c.argv)
+  expect(first.argv).toContain("--resume")
+  expect(first.argv).not.toContain("--fork-session")
+  expect(calls().find((c) => c.stdin).stdin).toBe("/compact")
+  expect(usage).toBe(4321) // Claude's /context total, not the messages-only post_tokens
+  expect(text).toContain("## Objective")
+  expect(text).toContain("1. Primary Request: CODE=7")
+  expect(text).not.toContain("read the transcript")
+  // the session mapping stays: Claude's own session is the compacted one
+  expect(JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8"))).toEqual({ ses_n: "claude-n" })
 })
 
 test("session generate (no output limit) is a side job too; without a Claude session it uses the text history", async () => {
