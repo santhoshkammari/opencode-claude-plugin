@@ -48,6 +48,7 @@ OpenCode ──► claude CLI (stream-json) ──► Claude runs its own tools
 - Streams text, thinking and tool input token by token.
 - One OpenCode session = one Claude session (`--resume`, fork, Plan mode → read-only).
 - Switch a session between Claude and any other provider without losing history.
+- `/compact` runs Claude's own compaction on the real session (headless `claude --resume <id> "/compact"`), so Claude's context actually shrinks. OpenCode-triggered compaction (auto-compact included) does the same after writing its summary; set `compactClaude: false` to turn that off.
 - Stop (Esc) interrupts Claude cleanly; failed auth/usage limits don't retry-loop.
 
 ## Install

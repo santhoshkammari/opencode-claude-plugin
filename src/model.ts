@@ -7,7 +7,7 @@ import { Mapper } from "./map.js"
 import { conversation, freshStart, promptText, summaryKey, upToDate } from "./history.js"
 import { getClaudeSession, getKnownSummary, setClaudeSession, setKnownSummary } from "./sessions.js"
 
-export interface Settings { cliPath?: string; cwd?: string; extraArgs?: string[]; systemPrompt?: string; tools?: string }
+export interface Settings { cliPath?: string; cwd?: string; extraArgs?: string[]; systemPrompt?: string; tools?: string; compactClaude?: boolean }
 
 /**
  * Lean mode: Claude Code with no harness. Two built-in tools (Bash, Read), no settings/hooks/CLAUDE.md, no MCP, no skills
@@ -172,6 +172,42 @@ export function isCompaction(prompt: LanguageModelV3CallOptions["prompt"]): bool
   return !!last && COMPACTION.test(textOf(last.content))
 }
 
+/** The user typed `/compact [instructions]` as a message: opencode sends it as plain text to the provider. */
+const COMPACT_CMD = /^\s*\/compact\b\s*(.*)$/s
+export function compactCommand(prompt: LanguageModelV3CallOptions["prompt"]): string | undefined {
+  const last = (prompt as any[]).filter((m) => m.role === "user").at(-1)
+  const m = last && COMPACT_CMD.exec(textOf(last.content).trim())
+  return m ? m[1].trim() : undefined
+}
+
+/**
+ * Claude's own `/compact` on a real Claude session, headless. `claude -p --resume <id> "/compact"` runs the same
+ * manual compaction as the TUI (writes a compact_boundary and the summary into the transcript), so Claude's real
+ * context shrinks, not just opencode's record of it. Slash commands must be on for this one call.
+ */
+export function compactClaude(s: Settings, modelId: string, session: string, cwd: string, instructions = ""): Promise<{ pre: number; post: number }> {
+  const args = [
+    "-p", "--output-format", "stream-json", "--verbose", "--model", modelId, "--resume", session,
+    "--tools", s.tools ?? "Bash,Read", "--setting-sources", "", "--strict-mcp-config",
+  ]
+  return new Promise((resolve, reject) => {
+    const child = spawn(s.cliPath ?? "claude", args, { cwd, env: childEnv(), stdio: ["pipe", "pipe", "pipe"] })
+    child.stdin.on("error", () => {})
+    child.stdin.end(("/compact " + instructions).trim())
+    let stderr = "", out = ""
+    let meta: { pre: number; post: number } | undefined
+    child.stderr.on("data", (d) => (stderr += d))
+    createInterface({ input: child.stdout }).on("line", (line) => {
+      let f: any
+      try { f = JSON.parse(line) } catch { return }
+      if (f.type === "system" && f.subtype === "compact_boundary") meta = { pre: f.compact_metadata?.pre_tokens ?? 0, post: f.compact_metadata?.post_tokens ?? 0 }
+      if (f.type === "result") out = String(f.result ?? "")
+    })
+    child.on("error", (e) => reject(new Error(`cannot run ${s.cliPath ?? "claude"}: ${e.message}`)))
+    child.on("close", (code) => (meta ? resolve(meta) : reject(new Error(out || stderr.trim() || `claude /compact failed (exit ${code})`))))
+  })
+}
+
 /**
  * Agent-context requests that must not become a turn in the Claude session: compaction, and session generate
  * (core/src/session/generate.ts, "generate from session context without mutating the session"). Primary turns
@@ -265,7 +301,7 @@ const trace = (o: Record<string, unknown>) => {
   if (process.env.OCN_DUMP) appendFileSync(process.env.OCN_DUMP, JSON.stringify({ trace: Date.now(), ...o }) + "\n")
 }
 
-const textStream = (text: string): ReadableStream<LanguageModelV3StreamPart> =>
+const textStream = (text: string, inputTokens = 0): ReadableStream<LanguageModelV3StreamPart> =>
   new ReadableStream<LanguageModelV3StreamPart>({
     start: (c) => {
       c.enqueue({ type: "stream-start", warnings: [] })
@@ -275,7 +311,7 @@ const textStream = (text: string): ReadableStream<LanguageModelV3StreamPart> =>
       c.enqueue({
         type: "finish",
         finishReason: { unified: "stop", raw: "stop" },
-        usage: { inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 0, text: 0, reasoning: 0 } },
+        usage: { inputTokens: { total: inputTokens, noCache: inputTokens, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 0, text: 0, reasoning: 0 } },
       } as any)
       c.close()
     },
@@ -314,6 +350,20 @@ export class ClaudeNativeModel implements LanguageModelV3 {
     // Compaction or generate: a tool-free reply from a throwaway fork of the Claude session, so it has the real
     // context but neither runs tools nor leaves the summary prompt in the transcript.
     if (isSideJob(o)) return this.helper(o, own, ocSession)
+
+    // `/compact` typed in opencode: compact the real Claude session instead of sending the word to Claude as a prompt.
+    const compactArg = compactCommand(o.prompt)
+    if (compactArg !== undefined) {
+      if (!own) return { stream: textStream("Nothing to compact: no Claude session for this conversation yet.") }
+      const done = compactClaude(this.s, this.modelId, own, workingDir(o.prompt, this.s.cwd), compactArg)
+      if (ocSession !== "default") running.set(ocSession, done.then(() => {}, () => {}))
+      try {
+        const { pre, post } = await done
+        return { stream: textStream(`Compacted Claude context: ${pre.toLocaleString("en")} → ${post.toLocaleString("en")} tokens.`, post) }
+      } catch (e: any) {
+        return { stream: new ReadableStream({ start: (c) => { c.enqueue({ type: "stream-start", warnings: [] }); c.enqueue({ type: "error", error: claudeError(e.message) }); c.enqueue({ type: "finish", finishReason: { unified: "error", raw: "error" }, usage: { inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 0, text: 0, reasoning: 0 } } }); c.close() } }) }
+      }
+    }
 
     // A fork's first turn: opencode sends the fork source as affinity (children send their parent, so skip those).
     // Branch the source's Claude transcript with --fork-session; the source session is left untouched.
@@ -459,7 +509,13 @@ export class ClaudeNativeModel implements LanguageModelV3 {
         child.on("close", (code) => {
           const failed = mapper.isError || (code !== 0 && !mapper.resultText)
           if (compaction && !failed) setKnownSummary(ocSession!, synced && summary.trim() ? summaryKey(summary) : undefined)
-          end(out, mapper, failed ? mapper.resultText || stderr || `claude exited ${code}` : undefined)
+          const finish = () => end(out, mapper, failed ? mapper.resultText || stderr || `claude exited ${code}` : undefined)
+          // opencode's summary only replaces opencode's own history; Claude's session would stay full. Compact it too.
+          if (compaction && !failed && resume && this.s.compactClaude !== false) {
+            const done = compactClaude(this.s, this.modelId, resume, cwd)
+            running.set(ocSession!, done.then(() => {}, () => {}))
+            done.then(finish, (e) => { trace({ event: "compact-failed", error: String(e) }); finish() })
+          } else finish()
         })
         // spawn failure (e.g. claude not on the PATH of opencode's service): fail the turn instead of an uncaught error
         child.on("error", (e) => end(out, mapper, `cannot run ${this.s.cliPath ?? "claude"}: ${e.message}`))

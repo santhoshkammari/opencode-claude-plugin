@@ -4,7 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createClaudeNative } from "../src/index"
-import { claudeError, opencodeInstructions } from "../src/model"
+import { claudeError, compactCommand, opencodeInstructions } from "../src/model"
 
 const fake = new URL("./fake-claude.mjs", import.meta.url).pathname
 chmodSync(fake, 0o755)
@@ -302,4 +302,12 @@ test("opencodeInstructions keeps AGENTS.md, date and env, drops opencode's own p
   expect(opencodeInstructions(sys(full))).toBe("Instructions from: /p/AGENTS.md\nRULE\n\nToday's date: X\n\n<env>\n  Working directory: /p\n</env>")
   expect(opencodeInstructions(sys("intro\nToday's date: X\n<env></env>"))).toBe("Today's date: X\n<env></env>")
   expect(opencodeInstructions(sys("You name conversations"))).toBe("")
+})
+
+test("compactCommand detects a typed /compact, with optional instructions", () => {
+  const p = (t: string) => [{ role: "user", content: [{ type: "text", text: t }] }] as any
+  expect(compactCommand(p("/compact "))).toBe("")
+  expect(compactCommand(p("/compact keep the SQL"))).toBe("keep the SQL")
+  expect(compactCommand(p("please /compact"))).toBeUndefined()
+  expect(compactCommand(p("/compaction"))).toBeUndefined()
 })
