@@ -24,6 +24,13 @@ export function setClaudeSession(opencodeSession: string, id: string) {
   writeFileSync(file(), JSON.stringify(m, null, 2))
 }
 
+export function clearClaudeSession(opencodeSession: string) {
+  const m = load()
+  if (!(opencodeSession in m)) return
+  delete m[opencodeSession]
+  writeFileSync(file(), JSON.stringify(m, null, 2))
+}
+
 // Compaction summaries Claude wrote while it had seen the whole conversation: opencode session -> summaryKey.
 // The next turn then treats that checkpoint as already known instead of sending it to Claude again.
 const summaries = () => file().replace(/\.json$/, "") + ".summaries.json"

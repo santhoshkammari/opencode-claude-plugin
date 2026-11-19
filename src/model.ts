@@ -5,7 +5,7 @@ import { createInterface } from "node:readline"
 import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { Mapper } from "./map.js"
 import { assistantCount, conversation, freshStart, hasCheckpoint, rewindPoint, promptText, summaryKey, upToDate } from "./history.js"
-import { getTurnEnds, setTurnEnds, getClaudeSession, getKnownSummary, setClaudeSession, setKnownSummary } from "./sessions.js"
+import { getTurnEnds, setTurnEnds, getClaudeSession, clearClaudeSession, getKnownSummary, setClaudeSession, setKnownSummary } from "./sessions.js"
 
 export interface Settings { cliPath?: string; cwd?: string; extraArgs?: string[]; systemPrompt?: string; tools?: string; compactClaude?: boolean }
 
@@ -591,12 +591,16 @@ export class ClaudeNativeModel implements LanguageModelV3 {
           const failed = mapper.isError || (code !== 0 && !mapper.resultText)
           if (compaction && !failed) setKnownSummary(ocSession!, synced && summary.trim() ? summaryKey(summary) : undefined)
           const finish = () => end(out, mapper, failed ? mapper.resultText || stderr || `claude exited ${code}` : undefined)
-          // opencode's summary only replaces opencode's own history; Claude's session would stay full. Compact it too.
-          if (compaction && !failed && resume && this.s.compactClaude !== false) {
+          // opencode's summary replaces its history. Default: drop Claude's session so the next turn starts fresh from
+          // that summary (instant, no second LLM call). compactClaude: true instead runs Claude's own /compact (~45s on 100k).
+          if (compaction && !failed && resume && this.s.compactClaude === true) {
             const done = compactClaude(this.s, this.modelId, resume, cwd)
             running.set(ocSession!, done.then(() => {}, () => {}))
             done.then(() => { setTurnEnds(ocSession!, {}); finish() }, (e) => { trace({ event: "compact-failed", error: String(e) }); finish() })
-          } else finish()
+          } else {
+            if (compaction && !failed && ocSession !== "default") { clearClaudeSession(ocSession!); setKnownSummary(ocSession!, undefined); setTurnEnds(ocSession!, {}) }
+            finish()
+          }
         })
         // spawn failure (e.g. claude not on the PATH of opencode's service): fail the turn instead of an uncaught error
         child.on("error", (e) => end(out, mapper, `cannot run ${this.s.cliPath ?? "claude"}: ${e.message}`))

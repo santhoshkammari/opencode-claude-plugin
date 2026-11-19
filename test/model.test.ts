@@ -218,8 +218,9 @@ test("compaction answers from a tool-free throwaway fork of the Claude session",
   expect(calls().find((c) => c.stdin).stdin).toContain("Do not continue the task")
   expect(calls().find((c) => c.argv).cwd).toBe(dir)
   expect(parts.filter((p) => p.type === "tool-call").length).toBe(5) // fixture replays tools; real claude has none
-  // the session map still points at the real session, not the fork
-  expect(JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8"))).toEqual({ ses_k: "claude-k" })
+  // opencode's summary replaces the history: no second Claude /compact, the session mapping is dropped so the next turn starts fresh
+  expect(calls().filter((c) => c.argv).length).toBe(1)
+  expect(JSON.parse(readFileSync(join(dir, "sessions.json"), "utf8"))).toEqual({})
 })
 
 test("session generate (no output limit) is a side job too; without a Claude session it uses the text history", async () => {
