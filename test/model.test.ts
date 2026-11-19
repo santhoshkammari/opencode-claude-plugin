@@ -4,6 +4,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { createClaudeNative } from "../src/index"
+import { rewindPoint } from "../src/history"
 import { claudeError, compactCommand, opencodeInstructions } from "../src/model"
 
 const fake = new URL("./fake-claude.mjs", import.meta.url).pathname
@@ -136,9 +137,10 @@ test("session map is keyed on x-opencode-session-id, not the shared affinity", a
 
 test("a model switch resumes the same Claude session with the new --model", async () => {
   const { dir, calls } = setup()
-  for (const id of ["haiku", "sonnet"]) {
+  const asst = { role: "assistant", content: [{ type: "text", text: "ok" }] }
+  for (const [i, id] of ["haiku", "sonnet"].entries()) {
     const model: any = agent(createClaudeNative({ cliPath: fake }).languageModel(id))
-    const { stream } = await model.doStream({ prompt: [system(dir), user("hi")], headers: { "x-opencode-session-id": "ses_f" } })
+    const { stream } = await model.doStream({ prompt: [system(dir), user("hi"), ...(i ? [asst, user("again")] : [])], headers: { "x-opencode-session-id": "ses_f" } })
     await collect(stream)
   }
   const argv = calls().filter((c) => c.argv).map((c) => c.argv)
@@ -310,4 +312,33 @@ test("compactCommand detects a typed /compact, with optional instructions", () =
   expect(compactCommand(p("/compact keep the SQL"))).toBe("keep the SQL")
   expect(compactCommand(p("please /compact"))).toBeUndefined()
   expect(compactCommand(p("/compaction"))).toBeUndefined()
+})
+
+test("rewindPoint: undo is fewer assistant messages than recorded turns", () => {
+  const ends = { 1: "u1", 2: "u2", 3: "u3" }
+  expect(rewindPoint(ends, 3)).toBeUndefined()
+  expect(rewindPoint(ends, 5)).toBeUndefined()
+  expect(rewindPoint(ends, 2)).toEqual({ uuid: "u2", keep: { 1: "u1", 2: "u2" } })
+  expect(rewindPoint(ends, 1)).toEqual({ uuid: "u1", keep: { 1: "u1" } })
+  expect(rewindPoint(ends, 0)).toEqual({ uuid: null, keep: {} })
+  expect(rewindPoint({}, 0)).toBeUndefined()
+})
+
+test("after /undo the next turn resumes at the recorded message; undoing everything starts fresh", async () => {
+  const { dir, calls } = setup()
+  const model: any = agent(createClaudeNative({ cliPath: fake }).languageModel("haiku"))
+  const asst = { role: "assistant", content: [{ type: "text", text: "ok" }] }
+  const turn = async (history: any[]) => {
+    const { stream } = await model.doStream({ prompt: [system(dir), ...history], headers: { "x-opencode-session-id": "ses_u" } })
+    await collect(stream)
+  }
+  await turn([user("one")])
+  await turn([user("one"), asst, user("two")])
+  await turn([user("one"), asst, user("two"), asst, user("three")])
+  await turn([user("one"), asst, user("four")]) // /undo of turns two and three
+  await turn([user("zero")]) // /undo of everything
+  const argv = calls().filter((c) => c.argv).map((c) => c.argv)
+  expect(argv[2]).not.toContain("--resume-session-at")
+  expect(argv[3]).toContain("--resume-session-at")
+  expect(argv[4]).not.toContain("--resume")
 })

@@ -4,8 +4,8 @@ import { tmpdir } from "node:os"
 import { createInterface } from "node:readline"
 import { APICallError, type LanguageModelV3, type LanguageModelV3CallOptions, type LanguageModelV3StreamPart } from "@ai-sdk/provider"
 import { Mapper } from "./map.js"
-import { conversation, freshStart, promptText, summaryKey, upToDate } from "./history.js"
-import { getClaudeSession, getKnownSummary, setClaudeSession, setKnownSummary } from "./sessions.js"
+import { assistantCount, conversation, freshStart, hasCheckpoint, rewindPoint, promptText, summaryKey, upToDate } from "./history.js"
+import { getTurnEnds, setTurnEnds, getClaudeSession, getKnownSummary, setClaudeSession, setKnownSummary } from "./sessions.js"
 
 export interface Settings { cliPath?: string; cwd?: string; extraArgs?: string[]; systemPrompt?: string; tools?: string; compactClaude?: boolean }
 
@@ -359,6 +359,7 @@ export class ClaudeNativeModel implements LanguageModelV3 {
       if (ocSession !== "default") running.set(ocSession, done.then(() => {}, () => {}))
       try {
         const { pre, post } = await done
+        if (ocSession !== "default") setTurnEnds(ocSession, {})
         return { stream: textStream(`Compacted Claude context: ${pre.toLocaleString("en")} → ${post.toLocaleString("en")} tokens.`, post) }
       } catch (e: any) {
         return { stream: new ReadableStream({ start: (c) => { c.enqueue({ type: "stream-start", warnings: [] }); c.enqueue({ type: "error", error: claudeError(e.message) }); c.enqueue({ type: "finish", finishReason: { unified: "error", raw: "error" }, usage: { inputTokens: { total: 0, noCache: 0, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 0, text: 0, reasoning: 0 } } }); c.close() } }) }
@@ -372,7 +373,25 @@ export class ClaudeNativeModel implements LanguageModelV3 {
       !own && affinity && affinity !== ocSession && !headers["x-opencode-parent-session-id"]
         ? getClaudeSession(affinity, this.modelId)
         : undefined
-    const existing = own ?? forkOf
+    // After opencode's /undo its history has fewer assistant messages than Claude's transcript has turns: rewind the
+    // Claude transcript to the matching message (everything undone: start a new Claude session from the history).
+    const count = assistantCount(o.prompt)
+    let ends = ocSession === "default" ? {} : getTurnEnds(ocSession)
+    let resumeAt: string | undefined
+    let live = own
+    if (own && ocSession !== "default") {
+      if (hasCheckpoint(o.prompt)) ends = {}
+      else {
+        const r = rewindPoint(ends, count)
+        if (r) {
+          trace({ event: "rewind", ocSession, count, to: r.uuid })
+          ends = r.keep
+          if (r.uuid) resumeAt = r.uuid
+          else live = undefined
+        }
+      }
+    }
+    const existing = live ?? forkOf
     const wantTitle = !own && ocSession !== "default"
     const args = [
       "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--include-partial-messages", "--verbose",
@@ -381,12 +400,13 @@ export class ClaudeNativeModel implements LanguageModelV3 {
       "--system-prompt", [this.s.systemPrompt ?? DEFAULT_SYSTEM_PROMPT, opencodeInstructions(o.prompt)].filter(Boolean).join("\n\n"),
       ...(inPlanMode(o.prompt) ? ["--permission-mode", "plan"] : ["--dangerously-skip-permissions"]),
       ...(existing ? ["--resume", existing] : []),
+      ...(resumeAt ? ["--resume-session-at", resumeAt] : []),
       ...(forkOf ? ["--fork-session"] : []),
       ...(this.s.extraArgs ?? []),
     ]
     const child = spawn(this.s.cliPath ?? "claude", args, { cwd: workingDir(o.prompt, this.s.cwd), env: childEnv(), stdio: ["pipe", "pipe", "pipe"] })
     if (ocSession !== "default") track(ocSession, child)
-    const known = own ? getKnownSummary(ocSession) : undefined
+    const known = live ? getKnownSummary(ocSession) : undefined
     const text = buildPrompt(o.prompt, !!existing, known)
     if (wantTitle) {
       // Claude Code's own title generator (tool-free Haiku call); persist writes the ai-title entry to the transcript.
@@ -424,6 +444,7 @@ export class ClaudeNativeModel implements LanguageModelV3 {
       if (resultSeen) child.stdin.end()
     }
     const mapper = new Mapper()
+    let lastUuid: string | undefined
     let out!: ReturnType<typeof writer>
     const stream: ReadableStream<LanguageModelV3StreamPart> = new ReadableStream<LanguageModelV3StreamPart>({
       start: (c) => {
@@ -438,6 +459,7 @@ export class ClaudeNativeModel implements LanguageModelV3 {
             settleTitle(typeof t === "string" && t.trim() ? t.trim() : undefined)
             return
           }
+          if (f.type === "assistant" && f.uuid && !f.parent_tool_use_id) lastUuid = f.uuid
           for (const p of mapper.feed(f)) out.push(p)
           // Save the Claude session as soon as it exists: a turn stopped early still has a transcript to resume.
           if (f.type === "system" && f.subtype === "init" && f.session_id && ocSession !== "default") setClaudeSession(ocSession, f.session_id)
@@ -453,6 +475,7 @@ export class ClaudeNativeModel implements LanguageModelV3 {
         child.on("close", (code) => {
           settleTitle(undefined)
           if (mapper.sessionId) setClaudeSession(ocSession, mapper.sessionId)
+          if (lastUuid && ocSession !== "default") setTurnEnds(ocSession, { ...ends, [count + 1]: lastUuid })
           const failed = mapper.isError || (code !== 0 && !mapper.resultText)
           end(out, mapper, failed ? mapper.resultText || stderr || `claude exited ${code}` : undefined)
         })
@@ -514,7 +537,7 @@ export class ClaudeNativeModel implements LanguageModelV3 {
           if (compaction && !failed && resume && this.s.compactClaude !== false) {
             const done = compactClaude(this.s, this.modelId, resume, cwd)
             running.set(ocSession!, done.then(() => {}, () => {}))
-            done.then(finish, (e) => { trace({ event: "compact-failed", error: String(e) }); finish() })
+            done.then(() => { setTurnEnds(ocSession!, {}); finish() }, (e) => { trace({ event: "compact-failed", error: String(e) }); finish() })
           } else finish()
         })
         // spawn failure (e.g. claude not on the PATH of opencode's service): fail the turn instead of an uncaught error

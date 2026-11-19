@@ -38,3 +38,19 @@ export function setKnownSummary(opencodeSession: string, key: string | undefined
   mkdirSync(dirname(summaries()), { recursive: true })
   writeFileSync(summaries(), JSON.stringify(m, null, 2))
 }
+
+// Undo support: for each opencode session, the last Claude message uuid after the Nth assistant message (N = count of
+// assistant messages in opencode's history at that point). opencode's /undo drops messages from its history; the next
+// turn rewinds the Claude transcript to the matching uuid (claude --resume-session-at).
+const turnsFile = () => file().replace(/\.json$/, "") + ".turns.json"
+const loadTurns = (): Record<string, Record<string, string>> => {
+  try { return existsSync(turnsFile()) ? JSON.parse(readFileSync(turnsFile(), "utf8")) : {} } catch { return {} }
+}
+export const getTurnEnds = (opencodeSession: string): Record<number, string> => loadTurns()[opencodeSession] ?? {}
+export function setTurnEnds(opencodeSession: string, ends: Record<number, string>) {
+  const m = loadTurns()
+  if (Object.keys(ends).length) m[opencodeSession] = ends
+  else delete m[opencodeSession]
+  mkdirSync(dirname(turnsFile()), { recursive: true })
+  writeFileSync(turnsFile(), JSON.stringify(m, null, 2))
+}

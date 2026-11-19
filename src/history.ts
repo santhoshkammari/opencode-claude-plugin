@@ -134,3 +134,22 @@ export function upToDate(prompt: Prompt, knownSummary?: string): boolean {
   const msgs = conversation(prompt)
   return !missedText(msgs, freshStart(msgs), knownSummary)
 }
+
+/** Assistant messages in opencode's history (it drops undone ones, so this falls after /undo). */
+export const assistantCount = (prompt: Prompt): number => conversation(prompt).filter((m) => m.role === "assistant").length
+
+/** True when the history starts from a compaction checkpoint (the message count is then not comparable). */
+export const hasCheckpoint = (prompt: Prompt): boolean => conversation(prompt).some((m) => checkpointSummary(m) !== undefined)
+
+/**
+ * Where to rewind after an undo. `ends` maps an assistant-message count to the Claude uuid recorded after it.
+ * Undo = the history has fewer assistant messages than the newest recorded count. Returns the uuid to resume at,
+ * `null` to start a fresh Claude session (everything undone), or undefined for no rewind. `keep` is the ends to keep.
+ */
+export function rewindPoint(ends: Record<number, string>, count: number): { uuid: string | null; keep: Record<number, string> } | undefined {
+  const keys = Object.keys(ends).map(Number)
+  if (!keys.length || count >= Math.max(...keys)) return
+  const k = Math.max(-1, ...keys.filter((n) => n <= count))
+  const keep = Object.fromEntries(keys.filter((n) => n <= k).map((n) => [n, ends[n]]))
+  return { uuid: k >= 0 ? ends[k] : null, keep }
+}
